@@ -1,0 +1,340 @@
+using System;
+using System.Text;
+using System.Collections;
+
+using NXOpen;
+using NXOpen.CAM;
+
+// Aliases
+using IOPath = System.IO.Path;
+using IODirectory = System.IO.Directory;
+using IOFile = System.IO.File;
+
+public class Post5Maquinas_SemSubpasta_Misto
+{
+    static bool DRY_RUN = false;
+
+    // Metric / Inch / PostDefined (depende do seu NX)
+    static CAMSetup.OutputUnits OUT_UNITS = CAMSetup.OutputUnits.Metric;
+
+    // fallback se peça não estiver salva
+    static string OUT_BASE_DIR = @"C:\Users\rogerio\Documents\resource\out_nc";
+
+    // limpar lixo do post
+    static bool CLEAN_OUTPUT = true;
+    static bool KEEP_WARNING_OUT = false;
+
+    // 5 máquinas simultâneas (Mitsubishi via TCL/DEF)
+    static PostSpec[] POSTS = new PostSpec[]
+    {
+        new PostSpec(
+            alias: "SPEED_MITSUBISHI",
+            machineType: "SPEED MITSUBISHI",   // não usado no modo TclDef
+            ext: ".txt",
+            mode: PostMode.TclDef,
+            tclPath: @"C:\Users\rogerio\Documents\resource\postprocessor\Mitsubishi.tcl",
+            defPath: @"C:\Users\rogerio\Documents\resource\postprocessor\Mitsubishi.def"
+        ),
+
+        new PostSpec("HAAS",             "HAAS",             ".nc",  PostMode.MachineType),
+        new PostSpec("SIEMENS_828D",     "SIEMENS 828D",     ".mpf", PostMode.MachineType),
+        new PostSpec("SPEED_SIEMENS_V1", "SPEED SIEMENS V1", ".mpf", PostMode.MachineType),
+        new PostSpec("SIEMENS_GRAF_V3",  "SIEMENS GRAF V3",  ".mpf", PostMode.MachineType),
+    };
+
+    public static int Main(string[] args)
+    {
+        Session theSession = Session.GetSession();
+        ListingWindow lw = theSession.ListingWindow;
+        lw.Open();
+
+        Part workPart = theSession.Parts.Work;
+        if (workPart == null) { lw.WriteLine("Nenhuma peça ativa."); return 0; }
+        if (workPart.CAMSetup == null) { lw.WriteLine("Peça sem setup CAM."); return 0; }
+
+        CAMSetup setup = workPart.CAMSetup;
+
+        // pasta da peça
+        string partFullPath = "";
+        try { partFullPath = workPart.FullPath; } catch { }
+
+        string partFolder = null;
+        if (!string.IsNullOrEmpty(partFullPath))
+        {
+            try { partFolder = IOPath.GetDirectoryName(partFullPath); } catch { partFolder = null; }
+        }
+        if (string.IsNullOrEmpty(partFolder) || !IODirectory.Exists(partFolder))
+            partFolder = OUT_BASE_DIR;
+
+        string partNameSafe = MakeSafeFileName(workPart.Leaf);
+
+        lw.WriteLine("=== POST 5 MÁQUINAS (MISTO: TCL/DEF + MachineType) ===");
+        lw.WriteLine("Peça: " + workPart.Leaf);
+        lw.WriteLine("FullPath: " + (string.IsNullOrEmpty(partFullPath) ? "(não salvo)" : partFullPath));
+        lw.WriteLine("DRY_RUN: " + DRY_RUN);
+        lw.WriteLine("Pasta base: " + partFolder);
+        lw.WriteLine("CLEAN_OUTPUT: " + CLEAN_OUTPUT + " | KEEP_WARNING_OUT: " + KEEP_WARNING_OUT);
+        lw.WriteLine("----------------------------------------");
+
+        // operações
+        NXOpen.CAM.Operation[] ops = setup.CAMOperationCollection.ToArray();
+        if (ops == null || ops.Length == 0)
+        {
+            lw.WriteLine("Nenhuma operação CAM encontrada.");
+            return 0;
+        }
+
+        // agrupar por NC_PROGRAM (ProgramOrder)
+        Hashtable programs = new Hashtable(); // Tag -> NCGroup
+        for (int i = 0; i < ops.Length; i++)
+        {
+            NXOpen.CAM.Operation op = ops[i];
+            NCGroup prog = op.GetParent(CAMSetup.View.ProgramOrder) as NCGroup;
+            if (prog == null) continue;
+
+            if (!programs.ContainsKey(prog.Tag))
+                programs[prog.Tag] = prog;
+        }
+
+        if (programs.Count == 0)
+        {
+            lw.WriteLine("Não achei NC_PROGRAMs (ProgramOrder).");
+            return 0;
+        }
+
+        // lista ordenada de programas por nome
+        ArrayList progList = new ArrayList();
+        foreach (DictionaryEntry de in programs)
+            progList.Add((NCGroup)de.Value);
+        progList.Sort(new NCGroupNameComparer());
+
+        // enums: escolhe Off/No se existir (pra não abrir review)
+        CAMSetup.PostprocessSettingsReviewTool reviewEnum = PickEnum_ReviewTool();
+        CAMSetup.PostprocessSettingsOutputWarning warnEnum = PickEnum_Warning();
+
+        int okTotal = 0, failTotal = 0;
+
+        // loop máquinas
+        for (int p = 0; p < POSTS.Length; p++)
+        {
+            PostSpec post = POSTS[p];
+
+            // pasta: MACHINE_PART (sem timestamp)
+            string machineSafe = MakeSafeFileName(post.Alias);
+            string outDir = IOPath.Combine(partFolder, machineSafe + "_" + partNameSafe);
+            IODirectory.CreateDirectory(outDir);
+
+            lw.WriteLine("=== MACHINE: " + post.Alias + " ===");
+            lw.WriteLine("Mode: " + post.Mode);
+            lw.WriteLine("MachineType: " + post.MachineType);
+            if (post.Mode == PostMode.TclDef)
+            {
+                lw.WriteLine("TCL: " + post.TclPath);
+                lw.WriteLine("DEF: " + post.DefPath);
+            }
+            lw.WriteLine("Ext: " + post.Ext);
+            lw.WriteLine("Saída: " + outDir);
+            lw.WriteLine("----------------------------------------");
+
+            // valida TCL/DEF se necessário
+            if (post.Mode == PostMode.TclDef)
+            {
+                if (string.IsNullOrEmpty(post.TclPath) || !IOFile.Exists(post.TclPath))
+                {
+                    lw.WriteLine("!! FAIL: TCL não existe: " + post.TclPath);
+                    failTotal += progList.Count;
+                    continue;
+                }
+                if (string.IsNullOrEmpty(post.DefPath) || !IOFile.Exists(post.DefPath))
+                {
+                    lw.WriteLine("!! FAIL: DEF não existe: " + post.DefPath);
+                    failTotal += progList.Count;
+                    continue;
+                }
+            }
+
+            int ok = 0, fail = 0;
+
+            for (int i = 0; i < progList.Count; i++)
+            {
+                NCGroup prog = (NCGroup)progList[i];
+                string progNameSafe = MakeSafeFileName(prog.Name);
+
+                string outNc = IOPath.Combine(outDir, progNameSafe + post.Ext);
+
+                lw.WriteLine(string.Format("[{0:00}] Programa: {1}", i + 1, prog.Name));
+
+                if (DRY_RUN)
+                {
+                    lw.WriteLine("     DRY_RUN -> não postei: " + outNc);
+                    ok++;
+                    continue;
+                }
+
+                try
+                {
+                    setup.GenerateToolPath(new CAMObject[] { prog });
+
+                    if (post.Mode == PostMode.MachineType)
+                    {
+                        setup.PostprocessWithSetting(
+                            new CAMObject[] { prog },
+                            post.MachineType,
+                            outNc,
+                            OUT_UNITS,
+                            warnEnum,
+                            reviewEnum
+                        );
+
+                        if (!IOFile.Exists(outNc))
+                            setup.Postprocess(new CAMObject[] { prog }, post.MachineType, outNc, OUT_UNITS);
+                    }
+                    else
+                    {
+                        setup.PostprocessWithPostprocessor(
+                            new CAMObject[] { prog },
+                            post.TclPath,
+                            post.DefPath,
+                            outNc,
+                            OUT_UNITS,
+                            warnEnum,
+                            reviewEnum
+                        );
+                    }
+
+                    if (!IOFile.Exists(outNc))
+                        throw new Exception("Post terminou mas não gerou NC: " + outNc);
+
+                    if (CLEAN_OUTPUT)
+                        CleanOutputFolder(outDir, KEEP_WARNING_OUT);
+
+                    lw.WriteLine("     OK -> " + outNc);
+                    ok++;
+                }
+                catch (Exception ex)
+                {
+                    lw.WriteLine("     FAIL -> " + outNc);
+                    lw.WriteLine("     Mode: " + post.Mode);
+                    lw.WriteLine("     Erro: " + ex.Message);
+                    fail++;
+                }
+            }
+
+            lw.WriteLine("----------------------------------------");
+            lw.WriteLine("Final (" + post.Alias + "): OK=" + ok + " | FAIL=" + fail);
+            lw.WriteLine("========================================");
+
+            okTotal += ok;
+            failTotal += fail;
+        }
+
+        lw.WriteLine("----------------------------------------");
+        lw.WriteLine("FINAL GERAL: OK=" + okTotal + " | FAIL=" + failTotal);
+        lw.WriteLine("=== FIM ===");
+
+        return 0;
+    }
+
+   
+    public enum PostMode { MachineType, TclDef }
+
+    public class PostSpec
+    {
+        public string Alias;
+        public string MachineType;
+        public string Ext;
+        public PostMode Mode;
+        public string TclPath;
+        public string DefPath;
+
+        public PostSpec(string alias, string machineType, string ext, PostMode mode, string tclPath = null, string defPath = null)
+        {
+            Alias = alias;
+            MachineType = machineType;
+            Ext = ext;
+            Mode = mode;
+            TclPath = tclPath;
+            DefPath = defPath;
+        }
+    }
+
+    public class NCGroupNameComparer : IComparer
+    {
+        public int Compare(object a, object b)
+        {
+            NCGroup ga = a as NCGroup;
+            NCGroup gb = b as NCGroup;
+            if (ga == null && gb == null) return 0;
+            if (ga == null) return -1;
+            if (gb == null) return 1;
+            return string.Compare(ga.Name, gb.Name, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    static CAMSetup.PostprocessSettingsReviewTool PickEnum_ReviewTool()
+    {
+        Array vals = Enum.GetValues(typeof(CAMSetup.PostprocessSettingsReviewTool));
+        for (int i = 0; i < vals.Length; i++)
+        {
+            object v = vals.GetValue(i);
+            if (string.Equals(v.ToString(), "Off", StringComparison.OrdinalIgnoreCase))
+                return (CAMSetup.PostprocessSettingsReviewTool)v;
+        }
+        return (CAMSetup.PostprocessSettingsReviewTool)vals.GetValue(0);
+    }
+
+    static CAMSetup.PostprocessSettingsOutputWarning PickEnum_Warning()
+    {
+        Array vals = Enum.GetValues(typeof(CAMSetup.PostprocessSettingsOutputWarning));
+        for (int i = 0; i < vals.Length; i++)
+        {
+            object v = vals.GetValue(i);
+            if (string.Equals(v.ToString(), "No", StringComparison.OrdinalIgnoreCase))
+                return (CAMSetup.PostprocessSettingsOutputWarning)v;
+        }
+        return (CAMSetup.PostprocessSettingsOutputWarning)vals.GetValue(0);
+    }
+
+    static string MakeSafeFileName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return "SEM_NOME";
+        char[] bad = IOPath.GetInvalidFileNameChars();
+        for (int i = 0; i < bad.Length; i++)
+            name = name.Replace(bad[i], '_');
+        return name;
+    }
+
+    static void CleanOutputFolder(string dir, bool keepWarning)
+    {
+        string[] patterns = new string[]
+        {
+            "*_debug.out",
+            "*_proc.out",
+            "*_review.out"
+        };
+
+        for (int i = 0; i < patterns.Length; i++)
+            DeleteByPattern(dir, patterns[i]);
+
+        if (!keepWarning)
+            DeleteByPattern(dir, "*_warning.out");
+    }
+
+    static void DeleteByPattern(string dir, string pattern)
+    {
+        try
+        {
+            string[] files = IODirectory.GetFiles(dir, pattern);
+            for (int i = 0; i < files.Length; i++)
+            {
+                try { IOFile.Delete(files[i]); } catch { }
+            }
+        }
+        catch { }
+    }
+
+    public static int GetUnloadOption(string dummy)
+    {
+        return (int)Session.LibraryUnloadOption.Immediately;
+    }
+}
